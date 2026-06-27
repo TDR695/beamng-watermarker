@@ -3,12 +3,27 @@ import io
 import requests
 import zipfile
 import tempfile
-import gc  # Garbage Collector to forcefully clear RAM
+import gc
+import threading
 from flask import Flask, request, send_file
 
 app = Flask(__name__)
 
 DROPBOX_DIRECT_URL = os.environ.get("DROPBOX_LINK")
+
+def download_file_worker(url, target_path, success_event):
+    """Downloads the heavy file in a separate thread so Flask never freezes."""
+    try:
+        with requests.get(url, stream=True) as response:
+            if response.status_code == 200:
+                with open(target_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            f.flush()
+                success_event.set() # Signal that download completed successfully
+    except Exception:
+        pass
 
 @app.route('/', defaults={'path': ''}, methods=['POST', 'GET'])
 @app.route('/<path:path>', methods=['POST', 'GET'])
@@ -27,30 +42,33 @@ def catch_all(path):
     temp_file_path = None
 
     try:
-        # 1. Create a temporary file path manually to have total control
+        # 1. Prepare manual temp file
         fd, temp_file_path = tempfile.mkstemp(dir="/tmp")
-        os.close(fd) # Close the file descriptor immediately so requests can write to it cleanly
+        os.close(fd)
 
-        # 2. Download directly to disk using a small stream buffer
-        with requests.get(DROPBOX_DIRECT_URL, stream=True) as response:
-            if response.status_code != 200:
-                return "Error pulling asset data from Dropbox storage.", 500
-            
-            with open(temp_file_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=4096): # Tiny 4KB chunks
-                    if chunk:
-                        f.write(chunk)
-                        f.flush() # Force write to disk, keeping RAM completely empty
+        # 2. Start the download in a background thread
+        download_success = threading.Event()
+        download_thread = threading.Thread(
+            target=download_file_worker, 
+            args=(DROPBOX_DIRECT_URL, temp_file_path, download_success)
+        )
+        download_thread.start()
 
-        # 3. Open zip, write the small text watermark, and close it immediately
+        # 3. Wait for the thread to finish (up to 10 minutes)
+        # This keeps the request alive but lets Gunicorn breathe and handle port scanning
+        completed = download_success.wait(timeout=600) 
+
+        if not completed or os.path.getsize(temp_file_path) == 0:
+            raise TimeoutError("The file download from storage timed out or failed.")
+
+        # 4. Open zip and append the license text file directly on disk
         with zipfile.ZipFile(temp_file_path, 'a', zipfile.ZIP_DEFLATED) as zipf:
             watermark_text = f"Buyer: {buyer_email}\nOrder: {order_id}"
             zipf.writestr("vehicles/audi6/license.txt", watermark_text)
 
-        # 4. CRITICAL: Force Python to purge any residual RAM usage before sending
         gc.collect()
 
-        # 5. Send the file using conditional streaming
+        # 5. Send the file back to the buyer
         response_file = send_file(
             temp_file_path,
             mimetype='application/zip',
@@ -58,7 +76,6 @@ def catch_all(path):
             download_name="audi6_fastlane_kajto.zip"
         )
         
-        # Tell Render to delete the file AFTER it has finished downloading to the customer
         @response_file.call_on_close
         def cleanup():
             if temp_file_path and os.path.exists(temp_file_path):
